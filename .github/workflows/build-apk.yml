@@ -1,0 +1,1806 @@
+name: build-apk
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK + NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-35 build-tools;35.0.0 ndk;26.1.10909125'
+
+      - name: Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Diagnose
+        run: |
+          echo "java: $(java -version 2>&1 | head -1)"
+          echo "gradle: $(gradle --version 2>/dev/null | grep Gradle | head -1)"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          ls "$ANDROID_HOME" 2>/dev/null || echo "!! no sdk dir"
+          ls "$ANDROID_HOME/ndk" 2>/dev/null || echo "!! no ndk dir"
+          ls "$ANDROID_HOME/platforms" 2>/dev/null || echo "!! no platforms"
+          which gcc || echo "!! no gcc"
+
+      - name: Keystore
+        run: |
+          mkdir -p ~/.android
+          keytool -genkeypair -v -keystore ~/.android/debug.keystore \
+            -storepass android -alias androiddebugkey -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Scaffold
+        run: |
+          mkdir -p app/src/main/java/ai/venice/vnx app/src/main/cpp \
+                   app/src/main/res/drawable app/src/main/assets
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "VNX"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.0" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          EOF
+
+          cat > app/proguard-rules.pro <<'EOF'
+          -keep class rikka.shizuku.** { *; }
+          -keep class moe.shizuku.** { *; }
+          -dontwarn rikka.shizuku.**
+          -dontwarn moe.shizuku.**
+          -dontwarn androidx.compose.**
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          android {
+              namespace = "ai.venice.vnx"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "ai.venice.vnx"
+                  minSdk = 24
+                  targetSdk = 35
+                  versionCode = 8
+                  versionName = "1.7"
+              }
+
+              buildTypes {
+                  getByName("debug") {
+                      isMinifyEnabled = false
+                  }
+                  getByName("release") {
+                      isMinifyEnabled = true
+                      proguardFiles(
+                          getDefaultProguardFile("proguard-android-optimize.txt"),
+                          "proguard-rules.pro"
+                      )
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              buildFeatures { compose = true }
+          }
+
+          kotlin {
+              compilerOptions {
+                  jvmTarget.set(JvmTarget.JVM_17)
+              }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.10.01"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.3")
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("dev.rikka.shizuku:api:13.1.5")
+              implementation("dev.rikka.shizuku:provider:13.1.5")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-permission android:name="moe.shizuku.manager.permission.API_V23"/>
+
+              <queries>
+                  <package android:name="moe.shizuku.privileged.api"/>
+                  <package android:name="com.dts.freefireth"/>
+                  <package android:name="com.dts.freefiremax"/>
+              </queries>
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="VNX Apex"
+                  android:hardwareAccelerated="true"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:configChanges="orientation|screenSize|keyboardHidden|uiMode">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".OverlaySvc"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="game memory overlay"/>
+                  </service>
+
+                  <provider
+                      android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="${applicationId}.shizuku"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:multiprocess="false"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"/>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_launcher.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#0B0E13" android:pathData="M0,0h108v108h-108z"/>
+              <path android:fillColor="#39FF88" android:pathData="M54,22a32,32 0 1,0 0,64a32,32 0 1,0 0,-64z"/>
+              <path android:fillColor="#0B0E13" android:pathData="M54,31a23,23 0 1,0 0,46a23,23 0 1,0 0,-46z"/>
+              <path android:fillColor="#39FF88" android:pathData="M51,10h6v32h-6z M51,66h6v32h-6z M10,51h32v6h-32z M66,51h32v6h-32z"/>
+              <path android:fillColor="#FF3D71" android:pathData="M51,51h6v6h-6z"/>
+          </vector>
+          EOF
+
+          cat > app/src/main/cpp/vnxmem.c <<'EOF'
+          #define _GNU_SOURCE
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include <ctype.h>
+          #include <unistd.h>
+          #include <fcntl.h>
+          #include <errno.h>
+          #include <math.h>
+          #include <sys/types.h>
+          #include <sys/wait.h>
+          #include <sys/ptrace.h>
+
+          #define CHUNK     (512u * 1024u)
+          #define MAXHITS   20000
+          #define FSET_CAP  150000
+          #define DEG2RAD   0.017453292519943295f
+          #define RAD2DEG   57.29577951308232f
+          #define DIRP      "/data/local/tmp/vnx"
+          #define FSET      DIRP "/fset.bin"
+          #define FSNAP     DIRP "/fset.bak"
+
+          static int   g_fd  = -1;
+          static pid_t g_pid = 0;
+          static int   g_ptrace_note = 0;
+
+          struct reg { unsigned long lo, hi; char perm[8]; char path[256]; };
+
+          static int rd(unsigned long a, void *b, size_t n) {
+              if (g_fd < 0 || !n) return -1;
+              return pread(g_fd, b, n, (off_t)a) == (ssize_t)n ? 0 : -1;
+          }
+
+          static int wr(unsigned long a, const void *b, size_t n) {
+              if (g_fd < 0 || !n) return -1;
+              return pwrite(g_fd, b, n, (off_t)a) == (ssize_t)n ? 0 : -1;
+          }
+
+          static int rd_stable(unsigned long a, void *b, size_t n) {
+              unsigned char *t = malloc(n ? n : 1);
+              if (!t) return -1;
+              int r = (!rd(a, b, n) && !rd(a, t, n) && !memcmp(b, t, n)) ? 0 : -1;
+              free(t);
+              return r;
+          }
+
+          static int tracerpid(pid_t pid) {
+              char p[64], buf[512];
+              snprintf(p, sizeof p, "/proc/%d/status", pid);
+              FILE *f = fopen(p, "r");
+              if (!f) return -1;
+              int t = -1;
+              while (fgets(buf, sizeof buf, f))
+                  if (!strncmp(buf, "TracerPid:", 10)) { t = atoi(buf + 10); break; }
+              fclose(f);
+              return t;
+          }
+
+          static int parse_maps(pid_t pid, struct reg **out) {
+              char p[64];
+              snprintf(p, sizeof p, "/proc/%d/maps", pid);
+              FILE *f = fopen(p, "r");
+              if (!f) { *out = NULL; return -1; }
+              size_t cap = 256, n = 0;
+              struct reg *v = malloc(cap * sizeof *v);
+              if (!v) { fclose(f); *out = NULL; return -1; }
+              char line[512];
+              while (fgets(line, sizeof line, f)) {
+                  if (n == cap) {
+                      cap *= 2;
+                      struct reg *nv = realloc(v, cap * sizeof *v);
+                      if (!nv) break;
+                      v = nv;
+                  }
+                  unsigned long lo = 0, hi = 0;
+                  char perm[8] = {0}, path[256] = {0};
+                  int k = sscanf(line, "%lx-%lx %7s %*s %*s %*s %255s", &lo, &hi, perm, path);
+                  if (k < 3) continue;
+                  v[n].lo = lo; v[n].hi = hi;
+                  memcpy(v[n].perm, perm, sizeof v[n].perm);
+                  memcpy(v[n].path, path, sizeof v[n].path);
+                  n++;
+              }
+              fclose(f);
+              *out = v;
+              return (int)n;
+          }
+
+          static const char *base_name(const char *p) {
+              const char *s = strrchr(p, '/');
+              return s ? s + 1 : p;
+          }
+
+          static int mem_open(pid_t pid) {
+              if (g_fd >= 0 && g_pid == pid) return 0;
+              if (g_fd >= 0) { close(g_fd); g_fd = -1; }
+
+              char path[64];
+              snprintf(path, sizeof path, "/proc/%d/mem", pid);
+
+              struct reg *v = NULL;
+              int nr = parse_maps(pid, &v);
+              unsigned long probe = 0;
+              for (int i = 0; i < nr; i++) {
+                  if (v[i].perm[0] == 'r' && (v[i].hi - v[i].lo) >= 64) { probe = v[i].lo; break; }
+              }
+              if (v) free(v);
+
+              int fd = open(path, O_RDWR);
+              if (fd >= 0) {
+                  g_fd = fd; g_pid = pid;
+                  if (!probe) return 0;
+                  unsigned char t[16];
+                  if (pread(fd, t, 16, (off_t)probe) == 16) return 0;
+                  close(fd); g_fd = -1;
+              }
+
+              if (ptrace(PTRACE_ATTACH, pid, 0, 0) != 0) {
+                  printf("! open %s failed and ptrace failed: %s\n", path, strerror(errno));
+                  return -1;
+              }
+              int st = 0;
+              waitpid(pid, &st, 0);
+              usleep(25000);
+              fd = open(path, O_RDWR);
+              ptrace(PTRACE_DETACH, pid, 0, 0);
+              if (fd < 0) { printf("! open %s after attach failed: %s\n", path, strerror(errno)); return -1; }
+              g_fd = fd; g_pid = pid;
+              if (probe) {
+                  unsigned char t[16];
+                  if (pread(fd, t, 16, (off_t)probe) != 16) { printf("! probe after attach failed\n"); return -1; }
+              }
+              g_ptrace_note = 1;
+              return 0;
+          }
+
+          static int compile_pat(char type, const char *str,
+                                 unsigned char *pat, unsigned char *msk, int *esz) {
+              *esz = 0;
+              switch (type) {
+                  case 'b':
+                      pat[0] = (unsigned char)strtol(str, NULL, 0);
+                      msk[0] = 0xFF; *esz = 1; return 1;
+                  case 'w': {
+                      unsigned long x = strtoul(str, NULL, 0);
+                      memcpy(pat, &x, 4); memset(msk, 0xFF, 4); *esz = 4; return 4;
+                  }
+                  case 'f': {
+                      float x = strtof(str, NULL);
+                      memcpy(pat, &x, 4); memset(msk, 0xFF, 4); *esz = 4; return 4;
+                  }
+                  case 'd': {
+                      double x = strtod(str, NULL);
+                      memcpy(pat, &x, 8); memset(msk, 0xFF, 8); *esz = 8; return 8;
+                  }
+                  case 'h': {
+                      int n = 0;
+                      const char *s = str;
+                      while (*s) {
+                          while (*s == ' ' || *s == ',') s++;
+                          if (!*s) break;
+                          if (s[0] == '?' && (s[1] == '?' || s[1] == 0)) {
+                              pat[n] = 0; msk[n] = 0; n++; s += s[1] ? 2 : 1;
+                              if (n >= 64) break;
+                              continue;
+                          }
+                          if (!isxdigit((unsigned char)s[0]) ||
+                              !isxdigit((unsigned char)s[1])) return -1;
+                          char b[3] = { s[0], s[1], 0 };
+                          pat[n] = (unsigned char)strtoul(b, NULL, 16);
+                          msk[n] = 0xFF; n++; s += 2;
+                          if (n >= 64) break;
+                      }
+                      return n;
+                  }
+                  default: return -1;
+              }
+          }
+
+          static int pat_match(const unsigned char *m, const unsigned char *pat,
+                               const unsigned char *msk, int n) {
+              if (msk[0] == 0xFF && m[0] != pat[0]) return 0;
+              for (int i = 1; i < n; i++)
+                  if ((m[i] & msk[i]) != (pat[i] & msk[i])) return 0;
+              return 1;
+          }
+
+          static int scan_region(unsigned long lo, unsigned long hi,
+                                 const unsigned char *pat, const unsigned char *msk,
+                                 int n, uint64_t *hits, int max) {
+              if (n <= 0 || max <= 0 || lo >= hi) return 0;
+              size_t bufsz = (size_t)CHUNK + (size_t)n;
+              unsigned char *buf = malloc(bufsz);
+              if (!buf) return 0;
+              int cnt = 0;
+              for (unsigned long a = lo; a < hi && cnt < max; a += CHUNK) {
+                  size_t want = (size_t)(hi - a) < bufsz ? (size_t)(hi - a) : bufsz;
+                  if (rd(a, buf, want)) continue;
+                  size_t lim = want >= (size_t)n ? want - (size_t)n : 0;
+                  for (size_t o = 0; o <= lim && cnt < max; o++)
+                      if (pat_match(buf + o, pat, msk, n)) hits[cnt++] = (uint64_t)(a + o);
+              }
+              free(buf);
+              return cnt;
+          }
+
+          static int hexb(const char *s, unsigned char *out, size_t cap) {
+              size_t n = 0;
+              while (*s && n < cap) {
+                  while (*s == ' ' || *s == ',') s++;
+                  if (!*s) break;
+                  if (!isxdigit((unsigned char)s[0])) { s++; continue; }
+                  int two = s[1] && isxdigit((unsigned char)s[1]);
+                  char b[3] = { s[0], two ? s[1] : '0', 0 };
+                  out[n++] = (unsigned char)strtoul(b, NULL, 16);
+                  s += two ? 2 : 1;
+              }
+              return (int)n;
+          }
+
+          static int type_bytes(char type, double v, unsigned char *out) {
+              switch (type) {
+                  case 'b': out[0] = (unsigned char)v; return 1;
+                  case 'w': { uint32_t x = (uint32_t)v; memcpy(out, &x, 4); return 4; }
+                  case 'f': { float x = (float)v; memcpy(out, &x, 4); return 4; }
+                  case 'd': { double x = v; memcpy(out, &x, 8); return 8; }
+                  default: return 0;
+              }
+          }
+
+          static int val_read(unsigned long a, char type, double *out) {
+              unsigned char b[8];
+              int n = type_bytes(type, 0, b);
+              if (n <= 0 || rd(a, b, (size_t)n)) return -1;
+              switch (type) {
+                  case 'b': *out = b[0]; break;
+                  case 'w': { uint32_t x; memcpy(&x, b, 4); *out = (double)x; break; }
+                  case 'f': { float x; memcpy(&x, b, 4); *out = (double)x; break; }
+                  case 'd': { double x; memcpy(&x, b, 8); *out = x; break; }
+              }
+              return 0;
+          }
+
+          static int val_write(unsigned long a, char type, double v) {
+              unsigned char b[8];
+              int n = type_bytes(type, v, b);
+              return n <= 0 ? -1 : wr(a, b, (size_t)n);
+          }
+
+          static int val_eq(double a, double b, char type) {
+              if (type == 'f') return fabsf((float)a - (float)b) <= 0.0005f;
+              if (type == 'd') return fabs(a - b) <= 1e-9;
+              return (uint64_t)a == (uint64_t)b;
+          }
+
+          static int fset_save(const uint64_t *a, uint32_t n, char type, const char *path) {
+              FILE *f = fopen(path, "wb");
+              if (!f) return -1;
+              fwrite(&n, 4, 1, f);
+              fwrite(&type, 1, 1, f);
+              if (n) fwrite(a, 8, n, f);
+              fclose(f);
+              return 0;
+          }
+
+          static int fset_load(uint64_t *a, uint32_t *n, char *type, const char *path) {
+              FILE *f = fopen(path, "rb");
+              if (!f) return -1;
+              if (fread(n, 4, 1, f) != 1) { fclose(f); return -1; }
+              if (fread(type, 1, 1, f) != 1) { fclose(f); return -1; }
+              if (*n > FSET_CAP) *n = FSET_CAP;
+              size_t got = fread(a, 8, *n, f);
+              *n = (uint32_t)got;
+              fclose(f);
+              return 0;
+          }
+
+          static int snap_save(const uint64_t *a, uint32_t n, char type) {
+              FILE *f = fopen(FSNAP, "wb");
+              if (!f) return -1;
+              fwrite(&n, 4, 1, f);
+              fwrite(&type, 1, 1, f);
+              for (uint32_t i = 0; i < n; i++) {
+                  double v = 0;
+                  val_read(a[i], type, &v);
+                  fwrite(&a[i], 8, 1, f);
+                  fwrite(&v, 8, 1, f);
+              }
+              fclose(f);
+              return 0;
+          }
+
+          static int snap_load(uint64_t *a, double *v, uint32_t *n, char *type) {
+              FILE *f = fopen(FSNAP, "rb");
+              if (!f) return -1;
+              if (fread(n, 4, 1, f) != 1) { fclose(f); return -1; }
+              if (fread(type, 1, 1, f) != 1) { fclose(f); return -1; }
+              if (*n > FSET_CAP) *n = FSET_CAP;
+              uint32_t got = 0;
+              for (uint32_t i = 0; i < *n; i++) {
+                  if (fread(&a[i], 8, 1, f) != 1) break;
+                  if (fread(&v[i], 8, 1, f) != 1) break;
+                  got++;
+              }
+              *n = got;
+              fclose(f);
+              return 0;
+          }
+
+          static int cmd_probe(pid_t pid) {
+              char p[64];
+              snprintf(p, sizeof p, "/proc/%d/status", pid);
+              FILE *f = fopen(p, "r");
+              if (!f) { printf("! /proc/%d/status unreadable: %s\n", pid, strerror(errno)); return 1; }
+              char line[256];
+              while (fgets(line, sizeof line, f)) {
+                  if (!strncmp(line, "Name:", 5) || !strncmp(line, "TracerPid:", 10) ||
+                      !strncmp(line, "State:", 6))
+                      printf("%s", line);
+              }
+              fclose(f);
+
+              struct reg *v = NULL;
+              int n = parse_maps(pid, &v);
+              printf("maps=%d\n", n);
+              unsigned long probe = 0;
+              if (n > 0) probe = v[0].lo;
+              if (v) free(v);
+
+              if (mem_open(pid)) { printf("RESULT: FAIL\n"); return 1; }
+              if (g_ptrace_note) printf("note: opened via ptrace attach/detach (safe, tracer released)\n");
+              unsigned char t[16];
+              int r = rd(probe, t, 16);
+              printf("probe=%016lx %s\n", probe, r ? "FAIL" : "OK");
+              printf("RESULT: %s\n", r ? "PARTIAL" : "OK");
+              return r ? 1 : 0;
+          }
+
+          static int cmd_aim(pid_t pid, unsigned long cam, unsigned long me, unsigned long arr,
+                             int count, int stride, int posoff, float smooth, float fov,
+                             char mode, int flags) {
+              if (mem_open(pid)) return 1;
+              printf("aim pid=%d cam=%lx me=%lx arr=%lx n=%d stride=%d posoff=%d smooth=%.2f fov=%.1f mode=%c flags=%d\n",
+                     pid, cam, me, arr, count, stride, posoff, smooth, fov, mode, flags);
+              int fail = 0, iter = 0;
+              for (;;) {
+                  iter++;
+                  float yaw = 0, pitch = 0, mp[3];
+                  if (rd(cam, &yaw, 4) || rd(cam + 4, &pitch, 4) || rd(me + posoff, mp, 12)) {
+                      if (++fail % 120 == 0) printf("! read fail x%d (cam/me wrong?)\n", fail);
+                      usleep(15000);
+                      continue;
+                  }
+                  unsigned long best = 0;
+                  float bestd = 1e30f;
+                  for (int i = 0; i < count; i++) {
+                      unsigned long e = arr + (unsigned long)i * (unsigned long)stride;
+                      if (stride == 4 || stride == 8) {
+                          unsigned long ep = 0;
+                          if (rd(e, &ep, (size_t)stride)) continue;
+                          if (!ep) continue;
+                          e = ep;
+                      }
+                      float p[3];
+                      if (rd(e + posoff, p, 12)) continue;
+                      float dx = p[0] - mp[0], dz = p[2] - mp[2];
+                      float h = sqrtf(dx * dx + dz * dz);
+                      if (h < 1.0f) continue;
+                      if (fov > 0.0f && h > fov) continue;
+                      if (h < bestd) { bestd = h; best = e; }
+                  }
+                  if (best) {
+                      float p[3];
+                      if (!rd(best + posoff, p, 12)) {
+                          float dx = p[0] - mp[0], dy = p[1] - mp[1], dz = p[2] - mp[2];
+                          float h = sqrtf(dx * dx + dz * dz);
+                          if (h > 0.01f) {
+                              float ty = (flags & 4) ? atan2f(dz, dx) * RAD2DEG
+                                                     : atan2f(dx, dz) * RAD2DEG;
+                              float tp = -atan2f(dy, h) * RAD2DEG;
+                              if (flags & 1) ty = -ty;
+                              if (flags & 2) tp = -tp;
+                              float d = ty - yaw;
+                              while (d > 180.0f) d -= 360.0f;
+                              while (d < -180.0f) d += 360.0f;
+                              yaw += d * smooth;
+                              pitch += (tp - pitch) * smooth;
+                              if (mode == 'q') {
+                                  float hy = yaw * 0.5f * DEG2RAD, hp = pitch * 0.5f * DEG2RAD;
+                                  float cy = cosf(hy), sy = sinf(hy);
+                                  float cx = cosf(hp), sx = sinf(hp);
+                                  float q[4] = { cy * sx, sy * cx, -sy * sx, cy * cx };
+                                  wr(cam, q, 16);
+                              } else {
+                                  wr(cam, &yaw, 4);
+                                  wr(cam + 4, &pitch, 4);
+                              }
+                          }
+                      }
+                  }
+                  if (iter % 125 == 0)
+                      printf("yaw=%.2f pitch=%.2f target=%s dist=%.1f\n",
+                             yaw, pitch, best ? "yes" : "no", bestd < 1e29f ? bestd : -1.0f);
+                  usleep(8000);
+              }
+          }
+
+          static void usage(void) {
+              printf(
+                  "vnxmem - non-root process memory tool\n"
+                  "  probe     <pid>\n"
+                  "  tracerpid <pid>\n"
+                  "  mods      <pid>\n"
+                  "  regions   <pid>\n"
+                  "  read      <pid> <hexaddr> <len>\n"
+                  "  write     <pid> <hexaddr> <hexbytes>\n"
+                  "  find      <pid> <lo> <hi> <b|w|f|d|h> <pattern>\n"
+                  "  findm     <pid> <module> <b|w|f|d|h> <pattern>\n"
+                  "  fnew      <pid> <module> <b|w|f|d> <value>\n"
+                  "  fnext     <pid> <b|w|f|d> <value>\n"
+                  "  frange    <pid> <b|w|f|d> <min> <max>\n"
+                  "  fshow     <pid> [limit]\n"
+                  "  fset      <pid> <index> <b|w|f|d> <value>\n"
+                  "  fsnap     <pid>\n"
+                  "  frestore  <pid>\n"
+                  "  freset\n"
+                  "  aim       <pid> <cam> <me> <arr> <count> <stride> <posoff> <smooth> <fov> [e|q] [flags]\n");
+          }
+
+          int main(int argc, char **argv) {
+              setvbuf(stdout, NULL, _IONBF, 0);
+              if (argc < 2) { usage(); return 1; }
+              const char *cmd = argv[1];
+
+              if (!strcmp(cmd, "help") || !strcmp(cmd, "-h") || !strcmp(cmd, "version")) {
+                  usage(); return 0;
+              }
+              if (!strcmp(cmd, "freset")) { unlink(FSET); unlink(FSNAP); printf("cleared\n"); return 0; }
+              if (argc < 3) { usage(); return 1; }
+
+              pid_t pid = (pid_t)atoi(argv[2]);
+              if (pid <= 0) { printf("! bad pid\n"); return 1; }
+
+              if (!strcmp(cmd, "tracerpid")) { printf("tracerpid %d\n", tracerpid(pid)); return 0; }
+              if (!strcmp(cmd, "probe")) return cmd_probe(pid);
+
+              if (!strcmp(cmd, "regions") || !strcmp(cmd, "mods")) {
+                  struct reg *v = NULL;
+                  int n = parse_maps(pid, &v);
+                  if (n < 0) { printf("! cannot read /proc/%d/maps\n", pid); return 1; }
+                  for (int i = 0; i < n; i++) {
+                      if (!strcmp(cmd, "mods")) {
+                          if (v[i].path[0] == '/' && strchr(v[i].perm, 'x'))
+                              printf("%016lx %9lu %s\n", v[i].lo,
+                                     (unsigned long)(v[i].hi - v[i].lo), base_name(v[i].path));
+                      } else {
+                          printf("%016lx-%016lx %s %s\n", v[i].lo, v[i].hi, v[i].perm, v[i].path);
+                      }
+                  }
+                  free(v);
+                  return 0;
+              }
+
+              if (mem_open(pid)) return 1;
+
+              if (!strcmp(cmd, "read") && argc >= 5) {
+                  unsigned long a = strtoul(argv[3], NULL, 16);
+                  size_t n = (size_t)strtoul(argv[4], NULL, 10);
+                  if (n == 0 || n > (8u << 20)) { printf("! bad len (1..8388608)\n"); return 1; }
+                  unsigned char *b = malloc(n);
+                  if (!b) return 1;
+                  if (rd_stable(a, b, n)) { free(b); printf("! read failed at %016lx\n", a); return 1; }
+                  for (size_t i = 0; i < n; i++) printf("%02x", b[i]);
+                  printf("\n");
+                  free(b);
+                  return 0;
+              }
+
+              if (!strcmp(cmd, "write") && argc >= 5) {
+                  unsigned long a = strtoul(argv[3], NULL, 16);
+                  size_t cap = strlen(argv[4]) / 2 + 2;
+                  unsigned char *b = malloc(cap);
+                  unsigned char *chk = malloc(cap);
+                  if (!b || !chk) { free(b); free(chk); return 1; }
+                  int got = hexb(argv[4], b, cap);
+                  if (got <= 0) { free(b); free(chk); printf("! empty hex\n"); return 1; }
+                  int r = wr(a, b, (size_t)got);
+                  int v = rd(a, chk, (size_t)got);
+                  int same = !r && !v && !memcmp(b, chk, (size_t)got);
+                  free(b); free(chk);
+                  if (r) { printf("! write failed\n"); return 1; }
+                  printf(same ? "ok %d bytes @ %016lx (verified)\n"
+                              : "warn %d bytes @ %016lx (readback differs)\n", got, a);
+                  return 0;
+              }
+
+              if (!strcmp(cmd, "find") && argc >= 7) {
+                  unsigned char pat[64], msk[64]; int esz = 0;
+                  int n = compile_pat(argv[5][0], argv[6], pat, msk, &esz);
+                  if (n <= 0) { printf("! bad pattern\n"); return 1; }
+                  unsigned long lo = strtoul(argv[3], NULL, 16), hi = strtoul(argv[4], NULL, 16);
+                  if (lo >= hi) { printf("! bad range\n"); return 1; }
+                  uint64_t *hits = malloc((size_t)MAXHITS * sizeof *hits);
+                  if (!hits) return 1;
+                  int t = scan_region(lo, hi, pat, msk, n, hits, MAXHITS);
+                  for (int i = 0; i < t; i++) printf("%016llx\n", (unsigned long long)hits[i]);
+                  printf("hits %d%s\n", t, t >= MAXHITS ? " (truncated)" : "");
+                  free(hits);
+                  return t ? 0 : 2;
+              }
+
+              if (!strcmp(cmd, "findm") && argc >= 6) {
+                  unsigned char pat[64], msk[64]; int esz = 0;
+                  int n = compile_pat(argv[4][0], argv[5], pat, msk, &esz);
+                  if (n <= 0) { printf("! bad pattern\n"); return 1; }
+                  struct reg *v = NULL;
+                  int rc = parse_maps(pid, &v);
+                  if (rc < 0) { printf("! cannot read maps\n"); return 1; }
+                  uint64_t *hits = malloc((size_t)MAXHITS * sizeof *hits);
+                  if (!hits) { free(v); return 1; }
+                  int t = 0;
+                  for (int i = 0; i < rc && t < MAXHITS; i++) {
+                      if (!strchr(v[i].perm, 'r')) continue;
+                      if (v[i].path[0] != '/') continue;
+                      if (strcmp(base_name(v[i].path), argv[3])) continue;
+                      t += scan_region(v[i].lo, v[i].hi, pat, msk, n, hits + t, MAXHITS - t);
+                  }
+                  free(v);
+                  for (int i = 0; i < t; i++) printf("%016llx\n", (unsigned long long)hits[i]);
+                  printf("hits %d%s\n", t, t >= MAXHITS ? " (truncated)" : "");
+                  free(hits);
+                  return t ? 0 : 2;
+              }
+
+              if (!strcmp(cmd, "fnew") && argc >= 6) {
+                  char type = argv[4][0];
+                  double val = (type == 'f') ? (double)strtof(argv[5], NULL) : strtod(argv[5], NULL);
+                  unsigned char pat[8], msk[8];
+                  int n = type_bytes(type, val, pat);
+                  if (n <= 0) { printf("! bad type\n"); return 1; }
+                  memset(msk, 0xFF, 8);
+                  struct reg *v = NULL;
+                  int rc = parse_maps(pid, &v);
+                  if (rc < 0) { printf("! cannot read maps\n"); return 1; }
+                  uint64_t *hits = malloc((size_t)FSET_CAP * sizeof *hits);
+                  if (!hits) { free(v); return 1; }
+                  int t = 0;
+                  for (int i = 0; i < rc && t < FSET_CAP; i++) {
+                      if (!strchr(v[i].perm, 'r')) continue;
+                      if (v[i].path[0] != '/') continue;
+                      if (strcmp(base_name(v[i].path), argv[3])) continue;
+                      t += scan_region(v[i].lo, v[i].hi, pat, msk, n, hits + t, FSET_CAP - t);
+                  }
+                  free(v);
+                  int r = fset_save(hits, (uint32_t)t, type, FSET);
+                  free(hits);
+                  if (r) { printf("! cannot save set\n"); return 1; }
+                  printf("set %d candidates (type %c)\n", t, type);
+                  return t ? 0 : 2;
+              }
+
+              if ((!strcmp(cmd, "fnext") || !strcmp(cmd, "frange")) && argc >= 5) {
+                  uint64_t *a = malloc((size_t)FSET_CAP * sizeof *a);
+                  uint64_t *keep = malloc((size_t)FSET_CAP * sizeof *keep);
+                  if (!a || !keep) { free(a); free(keep); return 1; }
+                  uint32_t n = 0; char t0 = 0;
+                  if (fset_load(a, &n, &t0, FSET)) { free(a); free(keep); printf("! no filter set\n"); return 1; }
+                  char type = argv[3][0];
+                  if (type != t0) { printf("! type mismatch: set holds '%c'\n", t0); free(a); free(keep); return 1; }
+                  uint32_t k = 0;
+                  if (!strcmp(cmd, "fnext")) {
+                      double want = (type == 'f') ? (double)strtof(argv[4], NULL) : strtod(argv[4], NULL);
+                      for (uint32_t i = 0; i < n; i++) {
+                          double v;
+                          if (val_read(a[i], type, &v)) continue;
+                          if (val_eq(v, want, type)) keep[k++] = a[i];
+                      }
+                  } else {
+                      if (argc < 6) { free(a); free(keep); printf("! need min max\n"); return 1; }
+                      double lo = strtod(argv[4], NULL), hi = strtod(argv[5], NULL);
+                      for (uint32_t i = 0; i < n; i++) {
+                          double v;
+                          if (val_read(a[i], type, &v)) continue;
+                          if (v >= lo && v <= hi) keep[k++] = a[i];
+                      }
+                  }
+                  free(a);
+                  fset_save(keep, k, type, FSET);
+                  free(keep);
+                  printf("remaining %u\n", k);
+                  return k ? 0 : 2;
+              }
+
+              if (!strcmp(cmd, "fshow")) {
+                  uint64_t *a = malloc((size_t)FSET_CAP * sizeof *a);
+                  if (!a) return 1;
+                  uint32_t n = 0; char t = 0;
+                  if (fset_load(a, &n, &t, FSET)) { free(a); printf("! no filter set\n"); return 1; }
+                  int lim = argc >= 4 ? atoi(argv[3]) : 40;
+                  if (lim <= 0 || lim > (int)n) lim = (int)n;
+                  for (int i = 0; i < lim; i++) {
+                      double v = 0;
+                      if (val_read(a[i], t, &v)) {
+                          printf("%6d %016llx ???\n", i, (unsigned long long)a[i]);
+                          continue;
+                      }
+                      if (t == 'f' || t == 'd')
+                          printf("%6d %016llx %.6f\n", i, (unsigned long long)a[i], v);
+                      else
+                          printf("%6d %016llx %llu\n", i, (unsigned long long)a[i],
+                                 (unsigned long long)v);
+                  }
+                  printf("count %u type %c\n", n, t);
+                  free(a);
+                  return 0;
+              }
+
+              if (!strcmp(cmd, "fset") && argc >= 6) {
+                  uint64_t *a = malloc((size_t)FSET_CAP * sizeof *a);
+                  if (!a) return 1;
+                  uint32_t n = 0; char t = 0;
+                  if (fset_load(a, &n, &t, FSET)) { free(a); printf("! no filter set\n"); return 1; }
+                  unsigned idx = (unsigned)atoi(argv[3]);
+                  if (idx >= n) { free(a); printf("! index range 0..%u\n", n ? n - 1 : 0); return 1; }
+                  char type = argv[4][0];
+                  double val = (type == 'f') ? (double)strtof(argv[5], NULL) : strtod(argv[5], NULL);
+                  int r = val_write(a[idx], type, val);
+                  double chk = 0;
+                  int ver = (!r && !val_read(a[idx], type, &chk) && val_eq(chk, val, type));
+                  free(a);
+                  if (r) { printf("! write failed\n"); return 1; }
+                  printf(ver ? "wrote index %u (verified)\n"
+                             : "warn index %u written (readback differs)\n", idx);
+                  return 0;
+              }
+
+              if (!strcmp(cmd, "fsnap")) {
+                  uint64_t *a = malloc((size_t)FSET_CAP * sizeof *a);
+                  if (!a) return 1;
+                  uint32_t n = 0; char t = 0;
+                  if (fset_load(a, &n, &t, FSET)) { free(a); printf("! no filter set\n"); return 1; }
+                  int r = snap_save(a, n, t);
+                  free(a);
+                  if (r) { printf("! snapshot failed\n"); return 1; }
+                  printf("snapshot saved: %u values\n", n);
+                  return 0;
+              }
+
+              if (!strcmp(cmd, "frestore")) {
+                  uint64_t *a = malloc((size_t)FSET_CAP * sizeof *a);
+                  double *v = malloc((size_t)FSET_CAP * sizeof *v);
+                  if (!a || !v) { free(a); free(v); return 1; }
+                  uint32_t n = 0; char t = 0;
+                  if (snap_load(a, v, &n, &t)) { free(a); free(v); printf("! no snapshot\n"); return 1; }
+                  int ok = 0, bad = 0;
+                  for (uint32_t i = 0; i < n; i++) {
+                      if (val_write(a[i], t, v[i])) bad++; else ok++;
+                  }
+                  free(a); free(v);
+                  printf("restored %d, failed %d\n", ok, bad);
+                  return bad ? 1 : 0;
+              }
+
+              if (!strcmp(cmd, "aim") && argc >= 11) {
+                  char mode = argc >= 12 ? argv[11][0] : 'e';
+                  int flags = argc >= 13 ? atoi(argv[12]) : 0;
+                  return cmd_aim(pid,
+                      strtoul(argv[3], NULL, 16), strtoul(argv[4], NULL, 16),
+                      strtoul(argv[5], NULL, 16), atoi(argv[6]), atoi(argv[7]), atoi(argv[8]),
+                      strtof(argv[9], NULL), strtof(argv[10], NULL), mode, flags);
+              }
+
+              usage();
+              return 1;
+          }
+          EOF
+
+          cat > app/src/main/java/ai/venice/vnx/ShizukuGate.kt <<'EOF'
+          package ai.venice.vnx
+
+          import android.content.pm.PackageManager
+          import androidx.activity.ComponentActivity
+          import rikka.shizuku.Shizuku
+
+          object ShizukuGate {
+              private const val REQ = 1337
+              private var attached = false
+
+              fun attach(a: ComponentActivity) {
+                  if (attached) return
+                  attached = true
+                  runCatching {
+                      Shizuku.addRequestPermissionResultListener { id, _ -> if (id == REQ) Unit }
+                  }
+              }
+
+              fun alive(): Boolean = runCatching { Shizuku.pingBinder() }.getOrDefault(false)
+
+              fun granted(): Boolean = runCatching {
+                  alive() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+              }.getOrDefault(false)
+
+              fun request() {
+                  runCatching {
+                      if (!alive()) return@runCatching
+                      if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) return@runCatching
+                      if (Shizuku.shouldShowRequestPermissionRationale()) return@runCatching
+                      Shizuku.requestPermission(REQ)
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/ai/venice/vnx/Shell.kt <<'EOF'
+          package ai.venice.vnx
+
+          import rikka.shizuku.Shizuku
+
+          object Shell {
+              private const val MARK = "__VNX_EOF_9F3A__"
+              private val lock = Any()
+              private var proc: Process? = null
+
+              private fun warm(): Process? {
+                  proc?.let { if (it.isAlive) return it }
+                  proc = null
+                  if (!ShizukuGate.granted()) return null
+                  val p = runCatching { Shizuku.newProcess(arrayOf("sh"), null, null) }.getOrNull()
+                      ?: return null
+                  proc = p
+                  runCatching {
+                      p.outputStream.write("echo ready\n".toByteArray())
+                      p.outputStream.flush()
+                  }
+                  return p
+              }
+
+              private fun drop() {
+                  runCatching { proc?.destroy() }
+                  proc = null
+              }
+
+              fun exec(cmd: String, timeoutMs: Long = 90_000L): String = synchronized(lock) {
+                  val p = warm() ?: return@synchronized "! shizuku not available"
+                  try {
+                      p.outputStream.write("$cmd 2>&1; echo $MARK\n".toByteArray())
+                      p.outputStream.flush()
+                  } catch (e: Exception) {
+                      drop()
+                      return@synchronized "! shell write failed: ${e.message}"
+                  }
+                  val sb = StringBuilder()
+                  val buf = ByteArray(8192)
+                  val deadline = System.currentTimeMillis() + timeoutMs
+                  while (true) {
+                      try {
+                          if (p.inputStream.available() > 0) {
+                              val n = p.inputStream.read(buf)
+                              if (n <= 0) { drop(); return@synchronized "! shell closed" }
+                              sb.append(String(buf, 0, n))
+                              val s = sb.toString()
+                              val i = s.indexOf(MARK)
+                              if (i >= 0) return@synchronized s.substring(0, i).trim()
+                          } else {
+                              if (!p.isAlive) {
+                                  drop()
+                                  val s = sb.toString().trim()
+                                  return@synchronized if (s.isEmpty()) "! shell closed" else s
+                              }
+                              if (System.currentTimeMillis() > deadline) {
+                                  return@synchronized "! timeout ${timeoutMs}ms: $cmd"
+                              }
+                              Thread.sleep(5)
+                          }
+                      } catch (e: Exception) {
+                          drop()
+                          return@synchronized "! shell read failed: ${e.message}"
+                      }
+                  }
+                  ""
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/ai/venice/vnx/Auth.kt <<'EOF'
+          package ai.venice.vnx
+
+          import android.content.Context
+          import java.security.MessageDigest
+
+          object Auth {
+              private const val SALT = "vnx-apex-9f3a"
+              private const val USER = "venice"
+              private const val PASS = "venice"
+
+              private fun p(c: Context) = c.getSharedPreferences("vnx", Context.MODE_PRIVATE)
+
+              private fun h(s: String): String =
+                  MessageDigest.getInstance("SHA-256")
+                      .digest((SALT + s).toByteArray())
+                      .joinToString("") { "%02x".format(it) }
+
+              fun seed(c: Context) {
+                  val sp = p(c)
+                  if (!sp.contains("u")) sp.edit().putString("u", USER).putString("h", h(PASS)).apply()
+              }
+
+              fun verify(c: Context, user: String, pass: String): Boolean {
+                  seed(c)
+                  val sp = p(c)
+                  return sp.getString("u", "") == user.trim() && sp.getString("h", "") == h(pass)
+              }
+
+              fun loggedIn(c: Context) = p(c).getBoolean("in", false)
+              fun login(c: Context) { p(c).edit().putBoolean("in", true).apply() }
+              fun logout(c: Context) { p(c).edit().putBoolean("in", false).apply() }
+          }
+          EOF
+
+          cat > app/src/main/java/ai/venice/vnx/Native.kt <<'EOF'
+          package ai.venice.vnx
+
+          import android.content.Context
+          import android.os.Build
+          import rikka.shizuku.Shizuku
+
+          object Native {
+              const val DIR = "/data/local/tmp/vnx"
+              const val BIN = "$DIR/vnxmem"
+              private val installed = HashSet<String>()
+
+              private fun abis(ctx: Context): List<String> =
+                  Build.SUPPORTED_ABIS.filter { a ->
+                      runCatching { ctx.assets.open("vnxmem-$a").close(); true }.getOrDefault(false)
+                  }
+
+              fun install(ctx: Context): String {
+                  val abi = abis(ctx).firstOrNull()
+                      ?: return "! no helper for ${Build.SUPPORTED_ABIS.joinToString()}"
+                  synchronized(installed) {
+                      if (installed.contains(abi)) return "helper already installed ($abi)"
+                      val bytes = ctx.assets.open("vnxmem-$abi").use { it.readBytes() }
+                      val script = "mkdir -p $DIR; cat > $BIN; chmod 755 $BIN; test -x $BIN && echo OK"
+                      val p = runCatching {
+                          Shizuku.newProcess(arrayOf("sh", "-c", script), null, null)
+                      }.getOrNull() ?: return "! shizuku.newProcess returned null"
+                      try {
+                          p.outputStream.use { it.write(bytes) }
+                      } catch (e: Exception) {
+                          return "! write failed: ${e.message}"
+                      }
+                      val out = p.inputStream.readBytes().toString(Charsets.UTF_8).trim()
+                      val code = p.waitFor()
+                      if (code != 0 || !out.contains("OK")) return "! install failed exit=$code out=$out"
+                      installed.add(abi)
+                      return "helper installed ($abi, ${bytes.size} bytes)"
+                  }
+              }
+
+              private fun digits(s: String): Boolean = s.isNotEmpty() && s.all { it.isDigit() }
+
+              fun pid(): String {
+                  for (pkg in listOf("com.dts.freefireth", "com.dts.freefiremax")) {
+                      val direct = Shell.exec("pidof $pkg").trim()
+                          .split(" ").firstOrNull().orEmpty().trim()
+                      if (digits(direct)) return direct
+
+                      val ps = Shell.exec("ps -A -o PID,ARGS 2>/dev/null")
+                      val line = ps.lines().firstOrNull { it.trim().endsWith(" $pkg") }
+                      val viaPs = line?.trim()?.split(" ")?.firstOrNull().orEmpty()
+                      if (digits(viaPs)) return viaPs
+                  }
+                  return ""
+              }
+
+              fun probe(pid: String) = if (pid.isBlank()) "! no pid" else Shell.exec("$BIN probe $pid")
+              fun mods(pid: String) = if (pid.isBlank()) "! no pid" else Shell.exec("$BIN mods $pid")
+              fun tracer(pid: String) = if (pid.isBlank()) "! no pid" else Shell.exec("$BIN tracerpid $pid")
+
+              fun read(pid: String, a: String, n: String) =
+                  if (pid.isBlank()) "! no pid" else Shell.exec("$BIN read $pid $a $n")
+
+              fun write(pid: String, a: String, hex: String) =
+                  if (pid.isBlank()) "! no pid" else Shell.exec("$BIN write $pid $a $hex")
+
+              fun findm(pid: String, mod: String, t: String, p: String) =
+                  if (pid.isBlank()) "! no pid" else Shell.exec("$BIN findm $pid $mod $t '$p'", 240_000L)
+
+              fun fnew(pid: String, mod: String, t: String, v: String) =
+                  if (pid.isBlank()) "! no pid" else Shell.exec("$BIN fnew $pid $mod $t $v", 240_000L)
+
+              fun fnext(pid: String, t: String, v: String) =
+                  if (pid.isBlank()) "! no pid" else Shell.exec("$BIN fnext $pid $t $v")
+
+              fun frange(pid: String, t: String, lo: String, hi: String) =
+                  if (pid.isBlank()) "! no pid" else Shell.exec("$BIN frange $pid $t $lo $hi")
+
+              fun fshow(pid: String, limit: String) = Shell.exec("$BIN fshow $pid $limit")
+
+              fun fset(pid: String, idx: String, t: String, v: String) =
+                  if (pid.isBlank()) "! no pid" else Shell.exec("$BIN fset $pid $idx $t $v")
+
+              fun fsnap(pid: String) = if (pid.isBlank()) "! no pid" else Shell.exec("$BIN fsnap $pid")
+              fun frestore(pid: String) = if (pid.isBlank()) "! no pid" else Shell.exec("$BIN frestore $pid")
+              fun freset() = Shell.exec("$BIN freset")
+
+              fun aim(pid: String, cam: String, me: String, arr: String, count: String,
+                      stride: String, posoff: String, smooth: String, fov: String,
+                      mode: String, flags: String): String {
+                  if (pid.isBlank()) return "! no pid"
+                  val cmd = "$BIN aim $pid $cam $me $arr $count $stride $posoff $smooth $fov $mode $flags"
+                  Shell.exec("( $cmd ) > $DIR/aim.log 2>&1 & echo started")
+                  return "aim running -> $DIR/aim.log"
+              }
+
+              fun aimStop(): String {
+                  Shell.exec("pkill -f '$BIN aim' 2>/dev/null")
+                  return "aim stopped"
+              }
+
+              fun aimLog() = Shell.exec("tail -n 25 $DIR/aim.log 2>/dev/null || echo '(no log yet)'")
+
+              fun selfTest(ctx: Context, pid: String): String {
+                  val sb = StringBuilder()
+                  var pass = 0
+                  var fail = 0
+                  fun step(name: String, ok: Boolean, detail: String) {
+                      if (ok) pass++ else fail++
+                      sb.append(if (ok) "[PASS] " else "[FAIL] ").append(name)
+                      if (detail.isNotEmpty()) sb.append(" :: ").append(detail.take(120))
+                      sb.append('\n')
+                  }
+
+                  val inst = install(ctx)
+                  step("01 install helper", inst.startsWith("helper"), inst)
+                  if (pid.isBlank()) {
+                      step("02 game pid", false, "Free Fire not running")
+                      return sb.append("\n").append(pass).append(" pass / ")
+                               .append(fail).append(" fail").toString()
+                  }
+                  step("02 game pid", true, pid)
+
+                  val pr = Shell.exec("$BIN probe $pid")
+                  val prLine = pr.lines().firstOrNull { it.startsWith("RESULT") } ?: pr.take(90)
+                  step("03 memory access", pr.contains("RESULT: OK"), prLine)
+
+                  val tp = Shell.exec("$BIN tracerpid $pid").trim()
+                  step("04 tracerpid is 0", tp.endsWith(" 0"), tp)
+
+                  val md = Shell.exec("$BIN mods $pid")
+                  val modCount = md.lines().count { it.isNotBlank() && !it.startsWith("!") }
+                  step("05 list modules", modCount > 3, "$modCount modules")
+
+                  val firstMod = md.lines().firstOrNull()?.trim()?.split(" ")
+                      ?.firstOrNull().orEmpty()
+                  if (firstMod.isNotEmpty()) {
+                      val rdOut = Shell.exec("$BIN read $pid 0x$firstMod 32")
+                      val hex = rdOut.lines().lastOrNull().orEmpty().trim()
+                      step("06 read memory",
+                           hex.length >= 32 && hex.all { it in "0123456789abcdefABCDEF" },
+                           "${hex.length} hex chars")
+                  } else {
+                      step("06 read memory", false, "no module base found")
+                  }
+
+                  val f1 = Shell.exec("$BIN fnew $pid libil2cpp.so f 1.0", 240_000L)
+                  val n1 = Regex("set (\\d+)").find(f1)?.groupValues?.get(1)?.toIntOrNull() ?: -1
+                  step("07 filter new search", n1 > 0, "candidates=$n1")
+
+                  if (n1 > 0) {
+                      val f2 = Shell.exec("$BIN fnext $pid f 1.0")
+                      val n2 = Regex("remaining (\\d+)").find(f2)
+                          ?.groupValues?.get(1)?.toIntOrNull() ?: -1
+                      step("08 filter narrow", n2 in 1..n1, "remaining=$n2")
+
+                      val fs = Shell.exec("$BIN fshow $pid 3")
+                      step("09 filter show", fs.contains("count "), fs.lines().lastOrNull().orEmpty())
+
+                      val sn = Shell.exec("$BIN fsnap $pid")
+                      step("10 snapshot", sn.contains("snapshot saved"), sn)
+
+                      val rs = Shell.exec("$BIN frestore $pid")
+                      step("11 restore (real write)", rs.contains("restored"), rs)
+                  } else {
+                      step("08 filter narrow", false, "no candidates")
+                      step("09 filter show", false, "skipped")
+                      step("10 snapshot", false, "skipped")
+                      step("11 restore (real write)", false, "skipped")
+                  }
+
+                  Shell.exec("$BIN freset")
+                  step("12 filter reset", true, "cleared")
+
+                  return sb.append("\n").append(pass).append(" pass / ")
+                           .append(fail).append(" fail").toString()
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/ai/venice/vnx/OverlaySvc.kt <<'EOF'
+          package ai.venice.vnx
+
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.PowerManager
+          import android.view.Gravity
+          import android.view.WindowManager
+          import android.widget.TextView
+          import androidx.core.app.NotificationCompat
+
+          class OverlaySvc : Service() {
+              companion object {
+                  @Volatile var running = false
+                  @Volatile var status = "VNX APEX"
+                  private const val CH = "vnx"
+              }
+
+              private var wm: WindowManager? = null
+              private var hud: TextView? = null
+              private var orb: TextView? = null
+              private var wake: PowerManager.WakeLock? = null
+              private val ui = Handler(Looper.getMainLooper())
+              private val tick = object : Runnable {
+                  override fun run() { hud?.text = status; ui.postDelayed(this, 1000L) }
+              }
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  running = true
+
+                  val pm = getSystemService(POWER_SERVICE) as PowerManager
+                  wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "vnx:aim").also { it.acquire() }
+
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                      nm.createNotificationChannel(
+                          NotificationChannel(CH, "VNX", NotificationManager.IMPORTANCE_LOW))
+                  }
+                  val n = NotificationCompat.Builder(this, CH)
+                      .setContentTitle("VNX Apex")
+                      .setContentText("overlay + aim active")
+                      .setSmallIcon(android.R.drawable.ic_menu_compass)
+                      .setOngoing(true)
+                      .setPriority(NotificationCompat.PRIORITY_LOW)
+                      .build()
+
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(1, n)
+                  }
+                  mount()
+                  ui.post(tick)
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun mount() {
+                  val w = getSystemService(WINDOW_SERVICE) as WindowManager
+                  wm = w
+                  val type = if (Build.VERSION.SDK_INT >= 26)
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                  else
+                      WindowManager.LayoutParams.TYPE_PHONE
+                  val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                              WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                              WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+
+                  val h = TextView(this).apply {
+                      text = status
+                      setTextColor(Color.parseColor("#39FF88"))
+                      textSize = 11f
+                      typeface = Typeface.MONOSPACE
+                      setBackgroundColor(Color.parseColor("#99000000"))
+                      setPadding(dp(8), dp(4), dp(8), dp(4))
+                  }
+                  val o = TextView(this).apply {
+                      text = "VNX"
+                      setTextColor(Color.parseColor("#39FF88"))
+                      textSize = 10f
+                      typeface = Typeface.MONOSPACE
+                      gravity = Gravity.CENTER
+                      setBackgroundColor(Color.parseColor("#66000000"))
+                  }
+                  hud = h
+                  orb = o
+
+                  val hp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      type, flags, PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.START; x = dp(12); y = dp(56) }
+
+                  val op = WindowManager.LayoutParams(
+                      dp(72), dp(72), type, flags, PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.END; x = dp(12); y = dp(56) }
+
+                  runCatching { w.addView(h, hp) }
+                  runCatching { w.addView(o, op) }
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  ui.removeCallbacks(tick)
+                  val w = wm
+                  val h = hud
+                  val o = orb
+                  if (w != null && h != null) runCatching { w.removeView(h) }
+                  if (w != null && o != null) runCatching { w.removeView(o) }
+                  runCatching { wake?.takeIf { it.isHeld }?.release() }
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/ai/venice/vnx/ReportCleaner.kt <<'EOF'
+          package ai.venice.vnx
+
+          object ReportCleaner {
+              private val PKGS = listOf("com.dts.freefireth", "com.dts.freefiremax")
+
+              fun run(): String {
+                  val sb = StringBuilder()
+                  var found = false
+                  for (pkg in PKGS) {
+                      if (!Shell.exec("pm path $pkg").contains("package:")) continue
+                      found = true
+                      Shell.exec("am force-stop $pkg")
+                      for (root in listOf("/data/user/0/$pkg", "/data/data/$pkg")) {
+                          Shell.exec(
+                              "rm -f $root/files/*.log 2>/dev/null; " +
+                              "rm -rf $root/cache/* 2>/dev/null; " +
+                              "rm -rf $root/files/report* 2>/dev/null"
+                          )
+                      }
+                      Shell.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1 > /dev/null 2>&1")
+                      sb.append("$pkg cleared + relaunched\n")
+                  }
+                  return if (found) sb.toString().trim() else "! Free Fire not installed"
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/ai/venice/vnx/MainActivity.kt <<'EOF'
+          package ai.venice.vnx
+
+          import android.Manifest
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.platform.LocalTextStyle
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.input.PasswordVisualTransformation
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.content.ContextCompat
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+
+          private val BG = Color(0xFF0B0E13)
+          private val CARD = Color(0xFF141922)
+          private val ACC = Color(0xFF39FF88)
+          private val DIM = Color(0xFF7A8798)
+          private val RED = Color(0xFFFF3D71)
+          private val FG = Color(0xFFE6EDF5)
+
+          class MainActivity : ComponentActivity() {
+              private var askedOverlay = false
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Auth.seed(this)
+                  ShizukuGate.attach(this)
+                  setContent {
+                      MaterialTheme(
+                          colorScheme = darkColorScheme(
+                              background = BG, surface = CARD,
+                              primary = ACC, onPrimary = BG, onSurface = FG
+                          )
+                      ) {
+                          Surface(Modifier.fillMaxSize().background(BG), color = BG) { Root() }
+                      }
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  if (!Settings.canDrawOverlays(this) && !askedOverlay) {
+                      askedOverlay = true
+                      runCatching {
+                          startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                              Uri.parse("package:$packageName")))
+                      }
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+                          PackageManager.PERMISSION_GRANTED) {
+                      runCatching { requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 7) }
+                  }
+                  if (Settings.canDrawOverlays(this) && !OverlaySvc.running) {
+                      runCatching {
+                          ContextCompat.startForegroundService(this, Intent(this, OverlaySvc::class.java))
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun Btn(label: String, color: Color = ACC, onClick: () -> Unit) {
+              Button(
+                  onClick = onClick,
+                  modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                  colors = ButtonDefaults.buttonColors(containerColor = color, contentColor = BG)
+              ) { Text(label, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp) }
+          }
+
+          @Composable
+          private fun Field(label: String, value: String, hint: String = "", onChange: (String) -> Unit) {
+              Column(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+                  Text(label, color = DIM, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                  OutlinedTextField(
+                      value = value,
+                      onValueChange = onChange,
+                      singleLine = true,
+                      modifier = Modifier.fillMaxWidth(),
+                      placeholder = { if (hint.isNotEmpty()) Text(hint, color = DIM, fontSize = 11.sp) },
+                      textStyle = LocalTextStyle.current.copy(
+                          fontFamily = FontFamily.Monospace, fontSize = 13.sp, color = FG)
+                  )
+              }
+          }
+
+          @Composable
+          private fun Head(t: String) {
+              Text(t, color = ACC, fontSize = 11.sp, fontFamily = FontFamily.Monospace,
+                  letterSpacing = 2.sp, modifier = Modifier.padding(top = 12.dp, bottom = 2.dp))
+          }
+
+          @Composable
+          private fun Root() {
+              val ctx = LocalContext.current
+              var shiz by remember { mutableStateOf(ShizukuGate.granted()) }
+              var inSession by remember { mutableStateOf(Auth.loggedIn(ctx)) }
+
+              LaunchedEffect(Unit) {
+                  while (true) { shiz = ShizukuGate.granted(); delay(1200L) }
+              }
+
+              if (!shiz) {
+                  Column(Modifier.fillMaxSize().padding(24.dp),
+                      verticalArrangement = Arrangement.Center,
+                      horizontalAlignment = Alignment.CenterHorizontally) {
+                      Text("VNX APEX", color = ACC, fontSize = 26.sp,
+                          fontWeight = FontWeight.Bold, letterSpacing = 4.sp)
+                      Spacer(Modifier.height(10.dp))
+                      Text("Shizuku is not running", color = DIM, fontSize = 12.sp)
+                      Spacer(Modifier.height(6.dp))
+                      Text("start Shizuku, then tap below", color = DIM, fontSize = 11.sp)
+                      Spacer(Modifier.height(24.dp))
+                      Btn("REQUEST SHIZUKU") { ShizukuGate.request() }
+                  }
+                  return
+              }
+
+              if (!inSession) { LoginScreen { inSession = true }; return }
+              Panel { inSession = false }
+          }
+
+          @Composable
+          private fun LoginScreen(done: () -> Unit) {
+              val ctx = LocalContext.current
+              var u by remember { mutableStateOf("venice") }
+              var p by remember { mutableStateOf("") }
+              var err by remember { mutableStateOf("") }
+
+              Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.Center) {
+                  Text("VNX APEX", color = ACC, fontSize = 24.sp,
+                      fontWeight = FontWeight.Bold, letterSpacing = 4.sp)
+                  Spacer(Modifier.height(20.dp))
+                  Field("USER", u) { u = it }
+                  Column(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+                      Text("PASS", color = DIM, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                      OutlinedTextField(
+                          value = p, onValueChange = { p = it }, singleLine = true,
+                          visualTransformation = PasswordVisualTransformation(),
+                          modifier = Modifier.fillMaxWidth(),
+                          textStyle = LocalTextStyle.current.copy(
+                              fontFamily = FontFamily.Monospace, fontSize = 13.sp, color = FG))
+                  }
+                  Spacer(Modifier.height(10.dp))
+                  Btn("ENTER") {
+                      if (Auth.verify(ctx, u, p)) { Auth.login(ctx); done() } else err = "bad credentials"
+                  }
+                  if (err.isNotEmpty()) {
+                      Spacer(Modifier.height(8.dp))
+                      Text(err, color = RED, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                  }
+              }
+          }
+
+          private val TABS = listOf("SETUP", "AIM", "SCAN", "FILTER")
+
+          @Composable
+          private fun TabBar(sel: Int, onSel: (Int) -> Unit) {
+              Row(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                  TABS.forEachIndexed { i, t ->
+                      val on = i == sel
+                      Box(
+                          Modifier.weight(1f).padding(horizontal = 2.dp)
+                              .background(if (on) ACC else CARD)
+                              .clickable { onSel(i) }
+                              .padding(vertical = 8.dp),
+                          contentAlignment = Alignment.Center
+                      ) {
+                          Text(t, color = if (on) BG else DIM, fontSize = 10.sp,
+                              fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun Panel(onLogout: () -> Unit) {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+
+              var tab by remember { mutableStateOf(0) }
+              var pid by remember { mutableStateOf("") }
+              var cam by remember { mutableStateOf("0x0") }
+              var me by remember { mutableStateOf("0x0") }
+              var arr by remember { mutableStateOf("0x0") }
+              var count by remember { mutableStateOf("64") }
+              var stride by remember { mutableStateOf("8") }
+              var posoff by remember { mutableStateOf("0x0") }
+              var smooth by remember { mutableStateOf("0.35") }
+              var fov by remember { mutableStateOf("60") }
+              var mode by remember { mutableStateOf("e") }
+              var flags by remember { mutableStateOf("0") }
+
+              var module by remember { mutableStateOf("libil2cpp.so") }
+              var type by remember { mutableStateOf("f") }
+              var pattern by remember { mutableStateOf("") }
+              var addr by remember { mutableStateOf("0x0") }
+              var len by remember { mutableStateOf("64") }
+              var value by remember { mutableStateOf("0") }
+              var idx by remember { mutableStateOf("0") }
+              var lo by remember { mutableStateOf("0") }
+              var hi by remember { mutableStateOf("100") }
+
+              var log by remember { mutableStateOf("ready") }
+              var busy by remember { mutableStateOf(false) }
+
+              fun run(block: suspend () -> String) {
+                  scope.launch {
+                      busy = true
+                      log = withContext(Dispatchers.IO) {
+                          runCatching { block() }.getOrElse { "! ${it.message}" }
+                      }
+                      busy = false
+                  }
+              }
+
+              Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
+                  Row(Modifier.fillMaxWidth(),
+                      horizontalArrangement = Arrangement.SpaceBetween,
+                      verticalAlignment = Alignment.CenterVertically) {
+                      Text("VNX APEX", color = ACC, fontSize = 20.sp,
+                          fontWeight = FontWeight.Bold, letterSpacing = 3.sp)
+                      Text(if (busy) "WORKING" else "IDLE",
+                          color = if (busy) ACC else DIM,
+                          fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                  }
+                  TabBar(tab) { tab = it }
+
+                  if (tab == 0) {
+                      Head("1 - PREPARE")
+                      Btn("INSTALL HELPER") { run { Native.install(ctx) } }
+                      Btn("FIND GAME PID") {
+                          run {
+                              val v = Native.pid()
+                              if (v.isNotEmpty()) pid = v
+                              if (v.isEmpty()) "! Free Fire not running" else "pid=$v"
+                          }
+                      }
+                      Btn("RUN FULL SELF TEST") { run { Native.selfTest(ctx, pid) } }
+                      Btn("TEST MEMORY ACCESS") { run { Native.probe(pid) } }
+                      Btn("CHECK ANTI-CHEAT TRACER") { run { Native.tracer(pid) } }
+                      Btn("LIST MODULES") { run { Native.mods(pid) } }
+                      Head("OVERLAY")
+                      Btn("START OVERLAY") {
+                          run {
+                              ContextCompat.startForegroundService(ctx, Intent(ctx, OverlaySvc::class.java))
+                              "overlay started"
+                          }
+                      }
+                      Btn("CLEAR FF REPORTS + RELAUNCH", DIM) { run { ReportCleaner.run() } }
+                      Head("PID")
+                      Field("PID", pid) { pid = it }
+                  }
+
+                  if (tab == 1) {
+                      Head("AIM CONFIG")
+                      Field("CAMERA ADDRESS", cam) { cam = it }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Field("LOCAL PLAYER", me) { me = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Field("ENTITY ARRAY", arr) { arr = it } }
+                      }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Field("COUNT", count) { count = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Field("STRIDE 4 or 8", stride) { stride = it } }
+                      }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Field("POS OFFSET", posoff) { posoff = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Field("SMOOTH 0-1", smooth) { smooth = it } }
+                      }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Field("FOV m (0=off)", fov) { fov = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Field("MODE e|q", mode) { mode = it } }
+                      }
+                      Field("FLAGS 0-7", flags) { flags = it }
+                      Spacer(Modifier.height(8.dp))
+                      Btn("START AIM") {
+                          run {
+                              OverlaySvc.status = "AIM ON"
+                              Native.aim(pid, cam, me, arr, count, stride, posoff, smooth, fov, mode, flags)
+                          }
+                      }
+                      Btn("STOP AIM", RED) { run { OverlaySvc.status = "VNX APEX"; Native.aimStop() } }
+                      Btn("AIM LOG", DIM) { run { Native.aimLog() } }
+                  }
+
+                  if (tab == 2) {
+                      Head("PATTERN SCAN")
+                      Field("MODULE", module) { module = it }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Field("TYPE b/w/f/d/h", type) { type = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Field("PATTERN", pattern, "48 8B ?? 05") { pattern = it } }
+                      }
+                      Btn("FIND IN MODULE") { run { Native.findm(pid, module, type, pattern) } }
+                      Head("DIRECT MEMORY")
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Field("ADDRESS", addr) { addr = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Field("LENGTH", len) { len = it } }
+                      }
+                      Btn("READ", DIM) { run { Native.read(pid, addr, len) } }
+                      Field("HEX BYTES", value, "00 00 80 3f") { value = it }
+                      Btn("WRITE", DIM) { run { Native.write(pid, addr, value) } }
+                  }
+
+                  if (tab == 3) {
+                      Head("VALUE FILTER")
+                      Text("b byte  w word  f float  d double",
+                          color = DIM, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                      Spacer(Modifier.height(6.dp))
+                      Field("MODULE", module) { module = it }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Field("TYPE", type) { type = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Field("VALUE", value) { value = it } }
+                      }
+                      Btn("NEW SEARCH") { run { Native.fnew(pid, module, type, value) } }
+                      Btn("FILTER EQUAL") { run { Native.fnext(pid, type, value) } }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Field("MIN", lo) { lo = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Field("MAX", hi) { hi = it } }
+                      }
+                      Btn("FILTER RANGE") { run { Native.frange(pid, type, lo, hi) } }
+                      Btn("SHOW RESULTS") { run { Native.fshow(pid, "40") } }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Field("INDEX", idx) { idx = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Field("VALUE", value) { value = it } }
+                      }
+                      Btn("WRITE INDEX") { run { Native.fset(pid, idx, type, value) } }
+                      Btn("SNAPSHOT", DIM) { run { Native.fsnap(pid) } }
+                      Btn("RESTORE SNAPSHOT", DIM) { run { Native.frestore(pid) } }
+                      Btn("RESET FILTER", DIM) { run { Native.freset() } }
+                  }
+
+                  Head("OUTPUT")
+                  val shown = if (log.length > 3500)
+                      "..." + (log.length - 3500) + " earlier chars\n" + log.takeLast(3500)
+                  else log
+                  Text(shown, color = DIM, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+
+                  Spacer(Modifier.height(16.dp))
+                  Btn("LOG OUT", DIM) { Auth.logout(ctx); onLogout() }
+                  Spacer(Modifier.height(24.dp))
+              }
+          }
+          EOF
+
+      - name: Verify C source compiles
+        run: |
+          gcc -O2 -Wall -o /tmp/vnxmem_host app/src/main/cpp/vnxmem.c -lm
+          /tmp/vnxmem_host help | head -3
+          echo "C source OK"
+
+      - name: Build native helper
+        run: |
+          set -euo pipefail
+          NDK="$ANDROID_HOME/ndk/26.1.10909125"
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          OUT=app/src/main/assets
+          mkdir -p "$OUT"
+          build() {
+            local abi="$1" triple="$2"
+            "$TC/${triple}24-clang" -O2 -static -fPIE -pie -ffunction-sections \
+              -fdata-sections -Wl,--gc-sections -Wall \
+              -o "$OUT/vnxmem-$abi" app/src/main/cpp/vnxmem.c -lm
+            "$TC/llvm-strip" "$OUT/vnxmem-$abi"
+            echo "built $abi -> $(stat -c%s "$OUT/vnxmem-$abi") bytes"
+          }
+          build arm64-v8a   aarch64-linux-android
+          build armeabi-v7a armv7a-linux-androideabi
+          build x86_64      x86_64-linux-android
+          build x86         i686-linux-android
+          for a in arm64-v8a armeabi-v7a x86_64 x86; do
+            test -s "$OUT/vnxmem-$a" || { echo "missing $a"; exit 1; }
+          done
+
+      - name: Assemble debug
+        run: |
+          set -o pipefail
+          gradle --no-daemon --stacktrace assembleDebug 2>&1 | tee /tmp/gradle.log
+
+      - name: Assemble release
+        run: |
+          set -o pipefail
+          gradle --no-daemon --stacktrace assembleRelease 2>&1 | tee -a /tmp/gradle.log
+
+      - name: Show build error
+        if: failure()
+        run: |
+          echo "=========== GRADLE ERROR (last 100 lines) ==========="
+          tail -n 100 /tmp/gradle.log 2>/dev/null || echo "(no log captured)"
+          echo "=========== END ==========="
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vnx-apex-apk
+          path: app/build/outputs/apk/**/*.apk
+          if-no-files-found: warn
